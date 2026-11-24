@@ -12,6 +12,7 @@ set -euo pipefail
 in=$(realpath "$1") out=$(realpath -m "$2") ks=$(realpath -m "$3")
 bt=${BT:?BT: the build-tools folder} aj=${ANDROID_JAR:?ANDROID_JAR} cc=${CONSCRYPT:?CONSCRYPT}
 here=$(cd "$(dirname "$0")/.." && pwd)
+mkdir -p "$(dirname "$out")" "$(dirname "$ks")"
 w=$(mktemp -d)
 trap 'rm -rf "$w"' EXIT
 mkdir -p "$w/gen/com/asoft/ios" "$w/classes" "$w/dex" "$w/old"
@@ -33,15 +34,22 @@ out.append('}')
 open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
 print('R: ' + ', '.join('%s %d' % (t, len(ns)) for t, ns in sorted(types.items())))
 PY
+# the libraries' own R classes (org.conscrypt.R: AGP makes one per library, empty here), as the official dex has them
+list() { for d in "$1"/classes*.dex; do "$bt/dexdump" "$d" | sed -n "s/^  Class descriptor  : '\(.*\)'$/\1/p"; done | sort -u; }
+unzip -q -o "$in" 'classes*.dex' -d "$w/old"
+list "$w/old" > "$w/old.txt"
+for r in $(grep -E '^L.*/R;$' "$w/old.txt" | grep -v '^Lcom/asoft/ios/R;$'); do
+    pkg=$(echo "$r" | sed 's|^L||; s|/R;$||')
+    mkdir -p "$w/gen/$pkg"
+    echo "package ${pkg//\//.}; public final class R { private R() {} }" > "$w/gen/$pkg/R.java"
+    echo "R: $pkg's (empty, as the official one)"
+done
 javac -nowarn --release 17 -encoding UTF-8 -cp "$aj:$cc" -d "$w/classes" \
-    "$here"/app/src/main/java/com/asoft/ios/*.java "$w/gen/com/asoft/ios/R.java"
+    "$here"/app/src/main/java/com/asoft/ios/*.java $(find "$w/gen" -name R.java)
 ( cd "$w/classes" && jar cf "$w/app.jar" . )
 minsdk=$("$bt/aapt2" dump badging "$in" | sed -n "s/^minSdkVersion:'\([0-9]*\)'.*/\1/p")
 "$bt/d8" --release --min-api "${minsdk:-29}" --lib "$aj" --output "$w/dex" "$w/app.jar" "$cc"
 # every class of the official dex must be in the new one
-unzip -q -o "$in" 'classes*.dex' -d "$w/old"
-list() { for d in "$1"/classes*.dex; do "$bt/dexdump" "$d" | sed -n "s/^  Class descriptor  : '\(.*\)'$/\1/p"; done | sort -u; }
-list "$w/old" > "$w/old.txt"
 list "$w/dex" > "$w/new.txt"
 missing=$(comm -23 "$w/old.txt" "$w/new.txt")
 if [ -n "$missing" ]; then

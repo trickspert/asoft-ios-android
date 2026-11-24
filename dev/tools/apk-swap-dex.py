@@ -39,6 +39,8 @@ def write(zout, info, data):
 
 with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, 'w') as zout:
     kept = 0
+    # the new dex files are packed as the official classes.dex was (AGP stores them, aligned, from minSdk 28 on)
+    dex_method = next((i.compress_type for i in zin.infolist() if i.filename == 'classes.dex'), zipfile.ZIP_DEFLATED)
     for info in zin.infolist():
         n = info.filename
         # (assets/dexopt: the baseline profile AGP made for the old dex's methods; the new dex goes without one)
@@ -49,6 +51,6 @@ with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, 'w') as zout:
     dexes = sorted(f for f in os.listdir(dexdir) if f.endswith('.dex'))
     for f in dexes:
         zi = zipfile.ZipInfo(f, date_time=(2026, 11, 24, 0, 0, 0))
-        zi.compress_type = zipfile.ZIP_DEFLATED
+        zi.compress_type = dex_method
         write(zout, zi, open(os.path.join(dexdir, f), 'rb').read())
     print('apk: %d entries kept, %d dex files new: %s' % (kept, len(dexes), ', '.join(dexes)))
