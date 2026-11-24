@@ -324,6 +324,111 @@ public class SetupLimitsTest {
         assertTrue(SetupLimits.MIGRATION_CEILING_MS > 3 * 60 * MIN);       // the old limit was 3 h
     }
 
+    /** run() with the disks' bytes written so far at second @s from @written (-1: unknown). */
+    private static MigrationWatch.Verdict runW(MigrationWatch w, long fromSec, long toSec, Pass pass,
+            java.util.function.LongUnaryOperator written, long[] stoppedAtSec) {
+        for (long s = fromSec; s <= toSec; s += 30) {
+            Obs o = pass.at(s);
+            long now = s * 1000;
+            w.observe(now, o.answered, o.text, o.frames, written.applyAsLong(s));
+            MigrationWatch.Verdict v = w.verdict(now);
+            if (v != MigrationWatch.Verdict.WAIT) {
+                stoppedAtSec[0] = s;
+                return v;
+            }
+        }
+        return MigrationWatch.Verdict.WAIT;
+    }
+
+    /**
+     * SM-S938U, 2026-11-24: from about minute 115 (modelled from pid 61,750 at minute 270 and 72,634 at 296, ~400 pids a
+     * minute) the console's own bash is respawned every ~10 s; a poll inside one bash's life is answered (the shell was
+     * "silent 4 min" at most ticks, never 15), so only the 5 h ceiling ended it, as "a slow phone".
+     */
+    private static final Pass S938U = s -> {
+        long onset = 115 * 60;
+        if (s < onset) {
+            return new Obs(true, "", 1320);
+        }
+        int pid = (int) (1250 + (s - onset) * 400 / 60);
+        boolean answered = (s / 30) % 8 == 0;
+        return new Obs(answered, ISSUE55_NOISE + amfi(pid) + "bash-5.3# \n", 1320);
+    };
+
+    @Test
+    public void aChurnWhoseShellAnswersNowAndThenIsStoppedAfterTwoHoursOfIt() {
+        MigrationWatch w = new MigrationWatch(0);
+        long[] at = new long[1];
+        MigrationWatch.Verdict v = run(w, 0, 6 * 3600, S938U, at);
+        assertEquals(MigrationWatch.Verdict.STALL_CHURN_ANSWERING, v);
+        long min = at[0] / 60;
+        // the first churning bucket starts at most a bucket after the onset; then 120 min of it
+        assertTrue("stopped at " + min, min >= 115 + 120 && min <= 115 + 120 + 2 * SetupLimits.CHURN_BUCKET_MS / MIN);
+        assertTrue(min * MIN < SetupLimits.MIGRATION_CEILING_MS);
+        assertTrue(w.silentMin(at[0] * 1000) < 15);
+        String text = MigrationWatch.stallText(v, w.silentMin(at[0] * 1000), w.churnMin(at[0] * 1000));
+        assertTrue(text, text.contains("restarting over and over for " + w.churnMin(at[0] * 1000) + " min"));
+        assertTrue(w.churnMin(at[0] * 1000) >= 120);
+    }
+
+    @Test
+    public void theSetupScreenSaysSoWhileAnAnsweringChurnGoesOn() {
+        MigrationWatch w = new MigrationWatch(0);
+        long[] at = new long[1];
+        assertEquals(MigrationWatch.Verdict.WAIT, run(w, 0, 180 * 60, S938U, at));
+        assertTrue(w.churningAnswering());
+        String status = w.quietStatus(180 * 60_000L);
+        assertTrue(status, status.contains("restarting over and over"));
+        assertFalse(new MigrationWatch(0).churningAnswering());
+    }
+
+    @Test
+    public void aShortChurnWithAnAnsweringShellIsLeftAlone() {
+        // like the S25's of 2026-11-14 (26 min, the counter past 13,850), but the shell answered now and then in it
+        long onset = 20 * 60, back = 46 * 60;
+        Pass pass = s -> {
+            if (s < onset || s >= back) {
+                return new Obs(true, "", 1320);
+            }
+            return new Obs((s / 30) % 8 == 0, ISSUE55_NOISE + amfi((int) (468 + (s - onset) * 8.6)), 1320);
+        };
+        MigrationWatch w = new MigrationWatch(0);
+        long[] at = new long[1];
+        assertEquals(MigrationWatch.Verdict.WAIT, run(w, 0, 4 * 3600, pass, at));
+        assertFalse(w.churning());
+    }
+
+    @Test
+    public void aSlowPhoneStillWritingItsDiskIsLetPastTheCeilingUntilTheWritesStop() {
+        // the shell answers, no churn; DataMigration writes about 1 MB/s until minute 340
+        Pass pass = s -> new Obs(true, "", 5);
+        java.util.function.LongUnaryOperator writes = s -> Math.min(s, 340 * 60) * (1L << 20);
+        MigrationWatch w = new MigrationWatch(0);
+        long[] at = new long[1];
+        assertEquals(MigrationWatch.Verdict.CEILING, runW(w, 0, 9 * 3600, pass, writes, at));
+        assertTrue("stopped at " + at[0] / 60, at[0] / 60 >= 340 + 29 && at[0] / 60 <= 340 + 31);
+        // writing all along: stopped at the longer ceiling
+        MigrationWatch w2 = new MigrationWatch(0);
+        assertEquals(MigrationWatch.Verdict.CEILING, runW(w2, 0, 9 * 3600, pass, s -> s * (1L << 20), at));
+        assertEquals(SetupLimits.MIGRATION_CEILING_MAX_MS / 1000, at[0]);
+        // a few log lines are no writes: the 5 h ceiling
+        MigrationWatch w3 = new MigrationWatch(0);
+        assertEquals(MigrationWatch.Verdict.CEILING, runW(w3, 0, 9 * 3600, pass, s -> s * 64, at));
+        assertEquals(SetupLimits.MIGRATION_CEILING_MS / 1000, at[0]);
+    }
+
+    @Test
+    public void aChurningBootIsNotLetPastTheCeilingForItsWrites() {
+        // the churn starts 10 min before the ceiling, too late for its own limit; its log writes do not extend the wait
+        long onset = (SetupLimits.MIGRATION_CEILING_MS / 1000) - 600;
+        Pass pass = s -> s < onset ? new Obs(true, "", 5)
+                : new Obs((s / 30) % 8 == 0, amfi((int) (1250 + (s - onset) * 400 / 60)), 5);
+        MigrationWatch w = new MigrationWatch(0);
+        long[] at = new long[1];
+        assertEquals(MigrationWatch.Verdict.CEILING, runW(w, 0, 9 * 3600, pass, s -> s * (1L << 20), at));
+        assertTrue(at[0] * 1000 < SetupLimits.MIGRATION_CEILING_MS + 2 * SetupLimits.CHURN_BUCKET_MS);
+    }
+
     @Test
     public void aShellThatComesBackIsNotAStall() {
         // #19: no answer at minute 55, read as done at 68.8; and 9 min of silence before a sync

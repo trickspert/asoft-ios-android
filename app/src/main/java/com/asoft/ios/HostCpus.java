@@ -12,8 +12,16 @@ final class HostCpus {
 
     /** "0-3", "0-7", "" when /proc/self/status cannot be read. */
     static String allowed() {
+        return allowed("self");
+    }
+
+    /**
+     * The same for process @pid ("self" for this one). QEMU is a child of the app (Render.spawn) and Android moves
+     * the app's own process between its cpusets: QEMU's list is the one its vCPUs run on.
+     */
+    static String allowed(String pid) {
         try (java.io.BufferedReader r = new java.io.BufferedReader(
-                new java.io.FileReader("/proc/self/status"))) {
+                new java.io.FileReader("/proc/" + pid + "/status"))) {
             for (String l; (l = r.readLine()) != null; ) {
                 if (l.startsWith("Cpus_allowed_list:")) {
                     return parse(l);
@@ -38,5 +46,11 @@ final class HostCpus {
     static String text() {
         String a = allowed();
         return a.isEmpty() ? "cpus ?" : "cpus " + a;
+    }
+
+    /** "cpus 0-1,4-5, qemu cpus 0-7": the app's, then QEMU's (@qemuPid; left out when it is not running or the same). */
+    static String text(int qemuPid) {
+        String q = qemuPid > 0 ? allowed(String.valueOf(qemuPid)) : "";
+        return text() + (q.isEmpty() || q.equals(allowed()) ? "" : ", qemu cpus " + q);
     }
 }

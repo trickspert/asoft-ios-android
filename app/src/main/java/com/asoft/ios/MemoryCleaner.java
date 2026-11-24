@@ -28,6 +28,8 @@ import java.util.Set;
 final class MemoryCleaner {
     private static final String PREFS = "asoft", KEY = "free_ram";
     private static final long PERIOD_MS = 90_000;
+    /** The timer's rounds (not the ones before a boot, a save or a helper job) only below this much available. */
+    static final long SKIP_ABOVE_MB = 3072;
     private static Thread loop;
 
     private MemoryCleaner() {}
@@ -63,8 +65,18 @@ final class MemoryCleaner {
             for (int i = 0; i < 100 && !Guest.running(); i++) {
                 sleep(200);
             }
+            boolean skipping = false;
             while (Guest.running() && enabled(app)) {
-                if (busy.compareAndSet(false, true)) {
+                // with this much free a round frees next to nothing (SM-S938U, 2026-11-24: 4.0 to 4.7 GB free for
+                // hours, each round -100 to +345 MB) and only starts adb's shell and the killed apps again
+                long free = Helper.available(app) >> 20;
+                if (free >= SKIP_ABOVE_MB) {
+                    if (!skipping) {
+                        skipping = true;
+                        AppLog.note(app, "free memory: " + free + " MB available, the rounds wait until it is below " + SKIP_ABOVE_MB + " MB");
+                    }
+                } else if (busy.compareAndSet(false, true)) {
+                    skipping = false;
                     try {
                         round(app, "free memory", 30_000);
                     } finally {

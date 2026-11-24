@@ -1316,7 +1316,7 @@ final class PhoneSetup26 {
             AppLog.note(c, "setup26: " + SystemAppMigrator.describe(sam) + "; migrators: " + (info == null ? "(no answer)" : info.trim()));
             long t1 = System.currentTimeMillis();
             long lastDiag = -1;
-            boolean diagOff = false;
+            long diagOffUntil = 0;
             String plist = "/var/mobile/Library/Preferences/com.apple.migration.plist";
             // an iOS whose shell goes silent (2026-11-12, a user's two boots: no answer from minute 50 or 61 on, QEMU
             // alive, no panic line): the last answer of its shell, and what its screen and its console log were at then
@@ -1331,7 +1331,7 @@ final class PhoneSetup26 {
             long[] watchAt = {serial.length()};
             long suspend0 = android.os.SystemClock.elapsedRealtime() - android.os.SystemClock.uptimeMillis();
             long lastTick = -1;
-            boolean toldSilent = false;
+            boolean toldSilent = false, toldWriting = false;
             LoopLate late = new LoopLate();
             while (true) {
                 if (cancelled.getAsBoolean()) {
@@ -1343,16 +1343,29 @@ final class PhoneSetup26 {
                 // (a slow phone, or iOS still working) looked frozen at exactly 85 % in the setup screen. Past
                 // 60 min it now moves a point every 15 min, up to 95.
                 int pct = min <= 60 ? 15 + (int) (min * 70 / 60) : 85 + (int) Math.min(10, (min - 60) / 15);
+                // (a boot whose programs keep restarting is not a slow phone: quietStatus says what it is instead)
                 p.step("ios26:wallpaper", pct, (min <= 75
                         ? "DataMigration is setting iOS up (" + min + " min; on a PC about " + SystemAppMigrator.pcMinutes(sam) + "). The phone may get warm."
                         : "DataMigration is taking longer than usual (" + min + " min; a phone needs about 60 to 75)."
-                                + " It can take a few hours on a slow phone; leave it running.") + watch.quietStatus(System.currentTimeMillis()));
+                                + (watch.churningAnswering() ? "" : " It can take a few hours on a slow phone; leave it running."))
+                        + watch.quietStatus(System.currentTimeMillis()));
                 // reset: a poll typed behind one that never ended, or onto a line with an open quote, never started
                 // (A#259, A#284); run() does not type a command again once bash has printed its start marker
                 String o = con.run("cat " + plist, 90_000, 60_000, true);
                 SetupTick.Poll poll = con.lastPoll();
                 long now = System.currentTimeMillis();
-                watch.observe(now, o != null, ConsoleLife.readNew(serial, watchAt, 1 << 20), framesShown(c));
+                // the disk's writes, from QEMU and not from the guest: a boot past the ceiling that still writes is
+                // left running (MigrationWatch.stillWriting)
+                Qmp q = Guest.qmp();
+                long written = q == null ? -1 : SetupEnd.sum(q.call("{\"execute\":\"query-blockstats\"}", 5000), "wr_bytes");
+                boolean wasChurning = watch.churningAnswering();
+                watch.observe(now, o != null, ConsoleLife.readNew(serial, watchAt, 1 << 20), framesShown(c), written);
+                if (watch.churningAnswering() != wasChurning) {
+                    AppLog.note(c, "setup26: " + (wasChurning ? "the churn ended" : "churn: the pid counter is racing (max " + watch.maxPid()
+                            + ") although the shell answers now and then; it is ended after "
+                            + SetupLimits.MIGRATION_CHURN_ANSWERING_MS / SetupLimits.MIN + " min of it")
+                            + " (minute " + min + ")");
+                }
                 if (o != null) {
                     answered = now;
                     quietTold = 0;
@@ -1385,7 +1398,7 @@ final class PhoneSetup26 {
                 if (o != null && o.contains("LastSystemVersion") || con.seen("LastSystemVersion")) {
                     break;
                 }
-                if (min / 5 != lastDiag && !diagOff) {
+                if (min / 5 != lastDiag && min >= diagOffUntil) {
                     // which migrator plugin is slow (datamigrator writes a stacks report per hang; 2026-11-09 the
                     // phone panicked on a SpringBoard.migrator hang that the PC only reports), and what crashes
                     lastDiag = min / 5;
@@ -1398,17 +1411,30 @@ final class PhoneSetup26 {
                             + " | sort -rn | head -8 | tr '\\n' ';'; s=$(ls -t stacks+com.apple.datamigrator* 2> /dev/null | head -1);"
                             + " [ -n \"$s\" ] && head -c 3000 \"$s\" | tr ',' '\\n' | while IFS= read -r l; do case \"$l\" in"
                             + " *Plugin:*|*\\\"reason\\\"*) echo \" ${l:0:260}\"; break;; esac; done", 60_000, 60_000, true);
-                    diagOff = d == null;        // a busy guest: no more of these in this boot
+                    // a busy guest: none for 30 min (it used to be none for the rest of the boot, so a record of a
+                    // 5 h boot named no migrator after its first missed answer)
+                    if (d == null) {
+                        diagOffUntil = min + 30;
+                    }
                     AppLog.note(c, "setup26: DataMigration " + min + " min, thermal " + thermal(c) + ", crash reports: "
                             + (d == null ? "(no answer)" : d.trim()));
                 }
                 MigrationWatch.Verdict v = watch.verdict(now);
+                if (!toldWriting && now - t1 >= SetupLimits.MIGRATION_CEILING_MS && v == MigrationWatch.Verdict.WAIT) {
+                    toldWriting = true;
+                    AppLog.note(c, "setup26: DataMigration past the " + SetupLimits.MIGRATION_CEILING_MS / SetupLimits.MIN
+                            + " min ceiling but its disk is still being written (" + (written >> 20) + " MB so far): waiting up to "
+                            + SetupLimits.MIGRATION_CEILING_MAX_MS / SetupLimits.MIN + " min");
+                }
                 if (v == MigrationWatch.Verdict.CEILING) {
                     // "keeps answering" only when it does: A#259's ceiling came after 64 min of a silent shell
                     long quietMin = (now - answered) / 60_000;
                     throw new IOException("DataMigration is still not done after " + min + " min, "
                             + (quietMin >= 15 ? "and iOS's console has not answered for " + quietMin + " min"
-                                    : "although iOS keeps answering") + ". Tap Resume to redo this boot.");
+                                    : "although iOS keeps answering")
+                            + (watch.churningAnswering() ? " (its programs have been restarting over and over for "
+                                    + watch.churnMin(now) + " min)" : "")
+                            + ". Tap Resume to redo this boot.");
                 }
                 if (v != MigrationWatch.Verdict.WAIT) {
                     throw stalled(c, serial, watch, v, now, min, framesShown(c),
@@ -1455,7 +1481,8 @@ final class PhoneSetup26 {
      */
     private static IOException stalled(Context c, File serial, MigrationWatch watch, MigrationWatch.Verdict v, long now, long min, int frames, String state) {
         long silent = watch.silentMin(now);
-        String kind = v == MigrationWatch.Verdict.STALL_CHURN ? "churn" : v == MigrationWatch.Verdict.STALL_DEAD ? "dead" : "silent";
+        String kind = v == MigrationWatch.Verdict.STALL_CHURN || v == MigrationWatch.Verdict.STALL_CHURN_ANSWERING ? "churn"
+                : v == MigrationWatch.Verdict.STALL_DEAD ? "dead" : "silent";
         File stalls = new File(work(c), "phone/stalls.txt");
         StallHistory h = StallHistory.load(stalls);
         int n = h.record("wallpaper", kind);
@@ -1465,10 +1492,12 @@ final class PhoneSetup26 {
         File err = new File(Guest.runDir(c), "qemu-stderr.txt");
         SetupTick.slice(serial, Math.max(0, serial.length() - SetupTick.SLICE), SetupTick.SLICE, new File(logs, "wallpaper-serial-stall-" + n + ".txt"));
         SetupTick.slice(err, Math.max(0, err.length() - SetupTick.SLICE), SetupTick.SLICE, new File(logs, "wallpaper-stderr-stall-" + n + ".txt"));
-        AppLog.note(c, "setup26: stall " + n + " (" + kind + ") at minute " + min + ": shell silent " + silent + " min, console pid max "
+        AppLog.note(c, "setup26: stall " + n + " (" + kind + (v == MigrationWatch.Verdict.STALL_CHURN_ANSWERING
+                ? ", " + watch.churnMin(now) + " min of it with the shell answering now and then" : "")
+                + ") at minute " + min + ": shell silent " + silent + " min, console pid max "
                 + watch.maxPid() + ", frames " + frames + ", " + SetupTick.engineText(err) + ", " + state
                 + "; the last 64 KB of console and QEMU's stderr are in phone/logs (wallpaper-*-stall-" + n + ".txt)");
-        return new IOException(StallHistory.userText(MigrationWatch.stallText(v, silent), n));
+        return new IOException(StallHistory.userText(MigrationWatch.stallText(v, silent, watch.churnMin(now)), n));
     }
 
     // -- packing into the app ------------------------------------------------------------------------------------
@@ -1723,7 +1752,7 @@ final class PhoneSetup26 {
             // a line without them is no harm
         }
         float batteryC = Battery.temperatureC(c);
-        return SetupTick.hostText(lateMs, on, idle, save, white, charging(c) ? 1 : 0, thermal(c)) + ", " + HostCpus.text()
+        return SetupTick.hostText(lateMs, on, idle, save, white, charging(c) ? 1 : 0, thermal(c)) + ", " + HostCpus.text(Guest.running() ? Guest.pid(c) : -1)
                 + (Float.isNaN(batteryC) ? "" : String.format(java.util.Locale.ROOT, ", battery %.1f C", batteryC));
     }
 

@@ -67,10 +67,37 @@ final class SetupLimits {
     static final int CHURN_RISE = 1_000;
 
     /**
+     * The churn measured by time instead of by the shell's silence: the pid counter is read in buckets of this
+     * length, and a bucket in which it rose by CHURN_BUCKET_RISE or more (1 pid/s; a whole healthy boot takes about
+     * 1,250) while past CHURN_PID is a churning one.
+     */
+    static final long CHURN_BUCKET_MS = 10 * MIN;
+    static final int CHURN_BUCKET_RISE = 600;
+
+    /**
+     * Churning without a break this long while the shell still answers now and then (SM-S938U, 2026-11-24: the
+     * console's bash itself is respawned every ~10 s, so a poll that fits in one bash's life is answered and one that
+     * spans a respawn is lost; the shell was never silent for 15 min, the pid counter went past 72,600, and the old
+     * rules waited for the 5 h ceiling and called it a slow phone). The same 120 min as a silent churn: the S25's
+     * churn of 2026-11-14 ended by itself after 26 min, none longer than #55's 125 min has.
+     */
+    static final long MIGRATION_CHURN_ANSWERING_MS = 120 * MIN;
+
+    /**
      * The shell answers but DataMigration is not done: a slow phone. 5 h = about 5 times the S25 (the old limit
      * was 3 h and only stalled guests reached it). A chosen number, not measured.
      */
     static final long MIGRATION_CEILING_MS = 5 * 60 * MIN;
+
+    /**
+     * Past the ceiling a boot that is not churning and whose disk was written in the last MIGRATION_WRITES_RECENT_MS
+     * (QEMU's block statistics: DataMigration writes the disk as it goes) is left running up to this: a phone that
+     * is slow, not stopped, is let finish.
+     */
+    static final long MIGRATION_CEILING_MAX_MS = 8 * 60 * MIN;
+    static final long MIGRATION_WRITES_RECENT_MS = 30 * MIN;
+    /** At least this much written since the last look counts as the disk being written (a few log lines are less). */
+    static final long MIGRATION_WRITES_MIN_BYTES = 4L << 20;
 
     /** The same stall this many times in a row: say so and ask for a report instead of looping. */
     static final int STALLS_BEFORE_REPORT = 3;
